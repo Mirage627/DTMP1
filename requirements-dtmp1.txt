@@ -1,0 +1,9 @@
+# Supplement an existing EfficientFlow / MP1 environment (Torch + simulator already installed).
+diffusers==0.27.2
+huggingface_hub==0.25.2
+swanlab==0.10.3
+pillow
+av
+filelock
+gdown
+chardet
