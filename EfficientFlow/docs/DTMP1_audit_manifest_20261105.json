@@ -1,0 +1,22 @@
+{
+  "date": "2026-11-05",
+  "scope": "DT-MP1 audit corrections; working-tree source",
+  "sha256": {
+    "EfficientFlow/policy/dt_mp1.py": "741b548dc8aa9a28b575078db3245d2e0b8f5cab91f7adb73807a3552900e6a2",
+    "EfficientFlow/common/dt_mp1_calibration.py": "a03000a988c12d7f70629620ec96b19524a4ad68f6c0ef60722e70f8ef50cc03",
+    "EfficientFlow/common/dt_mp1_preflight.py": "9195bd3345c9889b364c2e9ae3a37736cb8739b8d9634de0ddd9541edaec1487",
+    "EfficientFlow/common/mp1_observation_contract.py": "0c5f4fa09f41a8bfeb0fccb605373e573613eadd895af6e9c7b5119f9803a702",
+    "EfficientFlow/common/point_cloud_provenance.py": "a32c46754af1b54490f19cdae45e869e8088593351f2a4003adb6e7f6af5f8f8",
+    "EfficientFlow/common/dt_mp1_lifetime.py": "b57d11f890d4774e09b55385eef2deed7f8b53403cc49c131b2a8d56111ec4f0",
+    "EfficientFlow/workspace/train_dt_mp1_workspace.py": "ec7a7382d89c08140df7248bf9e4c08b3aae0fca93e8f5172092c5f4c4a260d4",
+    "EfficientFlow/config/DT_MP1.yaml": "7200c772385544a08746eb245dcd2024e9e59df37c5851d2b72c27f780d5b674",
+    "EfficientFlow/config/task/mimicgen_dt_pc_abs.yaml": "6bbda64303e07dce94739bc0889a853a21b89043b6adf303a5912270bf96d97f",
+    "EfficientFlow/env/robomimic/robomimic_image_wrapper.py": "823a11a7dbed3959c814efdd024b8b6e799b0a42b0205608bb517108681ece1b",
+    "EfficientFlow/scripts/dataset_states_to_obs.py": "70c702f17ba60d8bb83b5ee6b7371808aae443816e33a7aaf637363c43164446",
+    "EfficientFlow/scripts/diagnose_dt_mp1_lifetime.py": "0b1c5175f38d0366235adb4d49e209fc78df1c310fdf80cf339bef62ecfe5351",
+    "EfficientFlow/tests/test_dt_mp1.py": "c48f948658c54b662e9207c0094cb0ae46c436f693a5b4edd3b538e34e08d60a",
+    "EfficientFlow/docs/DTMP1_audit_response_20261105_zh.md": "a3869835236e8d6dc01825661a1e879906e1a51dc983d0505475a8332ea231df",
+    "EfficientFlow/README.md": "2d0e32101ebff86bc189e5cbfe84a8a400e8d70983d440191253b3ea37386f3f",
+    "EfficientFlow/docs/VALIDATION_DT_MP1.txt": "520495fdaf97533f7180d3951e72a2efabf0c35bb54bb41f8134cf45f5b1ed4c"
+  }
+}

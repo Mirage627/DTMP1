@@ -1,4 +1,4 @@
-"""MP1 with the DT v2.1 spatial tangent. Sampling is inherited unchanged."""
+"""MP1 spatial-tangent calibration with explicit gain-family contracts."""
 import math
 import torch
 from EfficientFlow.policy.mp1 import Meanpolicy, adaptive_l2_loss
@@ -22,7 +22,7 @@ class DTMP1Policy(Meanpolicy):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         if not self.obs_as_global_cond or self.condition_type != "film":
-            raise ValueError("DT-MP1 v2.1 requires MP1 global FiLM conditioning")
+            raise ValueError("DT-MP1 requires MP1 global FiLM conditioning")
         if not self.use_pc_color or kwargs["shape_meta"]["obs"]["point_cloud"]["shape"][-1] != 6:
             raise ValueError("DT-MP1 expects normalized XYZRGB with six channels")
         if not 1 <= self.n_action_steps <= self.horizon-self.n_obs_steps+1:
@@ -38,16 +38,24 @@ class DTMP1Policy(Meanpolicy):
         g = torch.zeros_like(self.dt_global)
         if family != "baseline":
             value = torch.as_tensor(gain, device=k.device, dtype=k.dtype)
+            if not torch.isfinite(value).all():
+                raise ValueError("Non-finite DT gain")
             if family == "global_scalar" and value.ndim == 0:
                 g.copy_(value)
                 size = g.abs()
             elif family in ("sub_scalar", "diagonal", "full") and value.shape == k.shape:
+                diagonal = torch.diag(torch.diagonal(value))
+                if family in ("diagonal", "sub_scalar") and not torch.equal(value, diagonal):
+                    raise ValueError(f"{family} requires an exactly diagonal gain")
+                if family == "sub_scalar" and not torch.equal(
+                        value, torch.eye(len(k), device=k.device, dtype=k.dtype)*value[0, 0]):
+                    raise ValueError("sub_scalar requires a scalar multiple of identity")
                 k.copy_(value)
                 size = torch.linalg.matrix_norm(k, ord=2)
             else:
                 raise ValueError(f"Wrong DT gain shape for {family}: {value.shape}")
             if not torch.isfinite(size) or size > 2:
-                raise ValueError("Invalid DT v2.1 gain")
+                raise ValueError("Invalid DT gain")
         self.dt_K.copy_(k)
         self.dt_global.copy_(g)
 
@@ -99,12 +107,19 @@ class DTMP1Policy(Meanpolicy):
         with torch.enable_grad():
             x,t,r,c,dw,v = self._draw(batch)
             active = t > r
-            y = dw.clone()
-            if active.any() and diagnostic != "none":
+            tangent = dw
+            if diagnostic != "none":
                 tangent = self.tangent(dw,v,active) if diagnostic=="normal" else torch.zeros_like(dw)
-                j = self._jvp(x[active],t[active],r[active],c[active],tangent[active],1)
-                y[active] -= (t-r)[active,None,None]*j
-            pred, features = self.model(x,t,r=r,global_cond=c)
+                # Keep the original MP1 full-batch primal/JVP graph for every
+                # family. Re-running the primal separately and masking JVP rows
+                # can perturb near-zero gradients; AdamW can amplify those ULPs.
+                (pred,features),(j,_) = torch.autograd.functional.jvp(
+                    lambda xx,tt,rr:self.model(xx,tt,r=rr,global_cond=c),
+                    (x,t,r),(tangent,torch.ones_like(t),torch.zeros_like(r)),create_graph=True)
+                y = dw-(t-r)[:,None,None]*j
+            else:
+                pred,features = self.model(x,t,r=r,global_cond=c)
+                y = dw
             error = pred-y.detach()
             reg = adaptive_l2_loss(error)
             dis = error.new_zeros(())
@@ -118,7 +133,10 @@ class DTMP1Policy(Meanpolicy):
             if not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite DT-MP1 loss; check input data/normalizer")
             return loss, {"bc_loss":loss.item(), "meanflow_loss":reg.item(),
-                          "dis_loss":dis.item(), "mse_val":error.detach().square().mean().item()}
+                          "dis_loss":dis.item(), "mse_val":error.detach().square().mean().item(),
+                          "dt_off_diagonal_fraction":active.float().mean().item(),
+                          "dt_correction_norm":(tangent-dw).flatten(1).norm(dim=1).mean().item(),
+                          "dt_gain_nonzero":float(bool(self.dt_global.ne(0) | self.dt_K.ne(0).any()))}
 
     @torch.no_grad()
     def calibration_rows(self, batch):

@@ -1,4 +1,4 @@
-"""DT v2.1 CPU checks: real six-channel MP1 policies, sampler contracts, and trainer."""
+"""DT CPU regression checks; these do not simulate CUDA or robot rollout success."""
 import copy
 import json
 import sys
@@ -18,7 +18,10 @@ sys.path.insert(0,str(ROOT.parent))
 from EfficientFlow.common.train_entry import register_resolvers
 from EfficientFlow.policy.mp1 import Meanpolicy
 from EfficientFlow.policy.dt_mp1 import DTMP1Policy
-from EfficientFlow.common.dt_mp1_calibration import train_normalizer, fit, partitions, choose
+from EfficientFlow.common.dt_mp1_calibration import train_normalizer, fit, partitions, choose, allocated_overhead
+from EfficientFlow.common.dt_mp1_preflight import rollout_preflight
+from EfficientFlow.common.mp1_observation_contract import validate_point_cloud
+from EfficientFlow.common.point_cloud_provenance import check_generated_cloud, observation_provenance
 from EfficientFlow.workspace.train_dt_mp1_workspace import TrainDTMP1Workspace, preflight_hdf5
 
 
@@ -56,7 +59,7 @@ def config():
     register_resolvers()
     with initialize_config_dir(config_dir=str(ROOT/"config"),version_base=None):
         c=compose(config_name="DT_MP1",overrides=["task_name=coffee_preparation_d1","n_demo=1000"])
-    c.task.shape_meta=OmegaConf.create({"obs":{"point_cloud":{"shape":[8,6],"type":"point_cloud"},
+    c.task.policy_shape_meta=OmegaConf.create({"obs":{"point_cloud":{"shape":[8,6],"type":"point_cloud"},
                                            "state":{"shape":[2]}},"action":{"shape":[10]}})
     c.policy.down_dims=[8,16]; c.policy.n_groups=2; c.policy.kernel_size=3
     c.policy.diffusion_step_embed_dim=8; c.policy.encoder_output_dim=8
@@ -117,6 +120,79 @@ class DTTests(unittest.TestCase):
         torch.testing.assert_close(direct,correct.squeeze(-1),rtol=2e-4,atol=2e-6)
         self.assertGreater(direct.norm().item(),1e-6)
 
+    def test_zero_gain_adamw_updates_two_batch_sizes(self):
+        for bs in (2,4):
+            with self.subTest(batch_size=bs):
+                dt,ref,b=self.models()
+                b={"action":b["action"][:bs],"obs":{k:v[:bs] for k,v in b["obs"].items()}}
+                losses=[]
+                for m in (ref,dt):
+                    opt=torch.optim.AdamW(m.parameters(),lr=1e-4,weight_decay=1e-6)
+                    np.random.seed(9); torch.manual_seed(11)
+                    loss,_=m.compute_loss(b); loss.backward(); losses.append(loss.detach())
+                    torch.nn.utils.clip_grad_norm_(m.parameters(),1.,error_if_nonfinite=True)
+                    opt.step()
+                torch.testing.assert_close(losses[0],losses[1],rtol=1e-5,atol=1e-6)
+                for (name,p),(other,q) in zip(ref.named_parameters(),dt.named_parameters()):
+                    self.assertEqual(name,other)
+                    torch.testing.assert_close(p,q,rtol=4e-4,atol=4e-6)
+
+    def test_gain_family_validation_is_atomic(self):
+        dt,_,_=self.models(); k=len(dt.dt_K)
+        previous=torch.eye(k)*.3
+        dt.set_gain("diagonal",previous)
+        bad=previous.clone(); bad[0,1]=.1
+        unequal=previous.clone(); unequal[0,0]=.4
+        cases=[("diagonal",bad),("sub_scalar",unequal),("full",torch.full((k,k),float('nan'))),
+               ("global_scalar",torch.tensor(3.))]
+        for family,gain in cases:
+            with self.assertRaises(ValueError): dt.set_gain(family,gain)
+            torch.testing.assert_close(dt.dt_K,previous)
+        dt.set_gain("sub_scalar",previous)
+
+    def test_actual_remaining_run_cost_allocation(self):
+        self.assertAlmostEqual(allocated_overhead(100.,1000,2.,60.),3.)
+        self.assertAlmostEqual(allocated_overhead(100.,10,2.,60.),100.)
+        self.assertGreater(allocated_overhead(100.,500,2.,60.),allocated_overhead(100.,1000,2.,60.))
+        with self.assertRaises(ValueError): allocated_overhead(1.,0,1.,60.)
+
+    def test_point_cloud_generation_contract(self):
+        self.assertIsNone(check_generated_cloud({}, required=False))
+        with self.assertRaisesRegex(ValueError, 'missing'):
+            check_generated_cloud({}, required=True)
+        cloud=np.ones((1024,6),dtype=np.float32)
+        report=check_generated_cloud({'point_cloud':cloud},required=True)
+        self.assertEqual(report['max'],[1.]*6)
+        cloud[0,4]=np.inf
+        with self.assertRaisesRegex(ValueError, 'non-finite'):
+            check_generated_cloud({'point_cloud':cloud})
+        provenance=observation_provenance()
+        self.assertIn('robomimic.envs.env_robosuite',provenance['modules'])
+        self.assertFalse(provenance['coordinate_frame_verified'])
+
+    def test_observation_contract_and_preflight(self):
+        dt,_,b=self.models()
+        raw={k:v.numpy() for k,v in b['obs'].items()}
+        steps=[]
+        env=SimpleNamespace(reset=lambda:raw,step=lambda a:(steps.append(a) or (raw,None,None,None)))
+        runner=SimpleNamespace(env=env,abs_action=False)
+        with tempfile.TemporaryDirectory() as d:
+            report=rollout_preflight(runner,dt,d,(8,6))
+            self.assertFalse(report['coordinate_frame_verified'])
+            self.assertFalse(report['color_scale_verified'])
+            self.assertEqual(steps[0].shape,(4,3,10))
+            self.assertTrue(dt.training)
+            with patch.object(env,'reset',return_value={'state':raw['state']}):
+                with self.assertRaisesRegex(RuntimeError,'point cloud'): rollout_preflight(runner,dt,d,(8,6))
+            self.assertTrue(dt.training)
+        cloud=raw['point_cloud'][0,0].copy()
+        validate_point_cloud({'point_cloud':cloud},'point_cloud',(8,6))
+        with self.assertRaisesRegex(ValueError,'missing'):
+            validate_point_cloud({},'point_cloud',(8,6))
+        cloud[0,0]=np.nan
+        with self.assertRaisesRegex(ValueError,'non-finite'):
+            validate_point_cloud({'point_cloud':cloud},'point_cloud',(8,6))
+
     def test_coffee_shapes_active_dt_vs_explicit_target(self):
         import hydra
         from EfficientFlow.model.common.normalizer import LinearNormalizer
@@ -124,6 +200,8 @@ class DTTests(unittest.TestCase):
         register_resolvers()
         with initialize_config_dir(config_dir=str(ROOT/"config"),version_base=None):
             cfg=compose(config_name="DT_MP1",overrides=["task_name=coffee_preparation_d1","n_demo=1000"])
+        self.assertFalse(any(s.get('type')=='rgb' for s in cfg.task.dataset.shape_meta.obs.values()))
+        self.assertIn('agentview_image',cfg.task.env_runner.shape_meta.obs)
         cfg.policy.down_dims=[8,16]; cfg.policy.n_groups=2
         cfg.policy.diffusion_step_embed_dim=8; cfg.policy.encoder_output_dim=8
         model=hydra.utils.instantiate(cfg.policy)
@@ -191,6 +269,28 @@ class DTTests(unittest.TestCase):
             self.assertEqual((ws.epoch,ws.global_step),(2,2))
             rep=json.loads((Path(d)/"dt_calibration.json").read_text())
             self.assertIn(rep["selected"],rep["candidates"])
+            self.assertEqual(rep['remaining_training_batches'],1)
+            self.assertIn('cost_scope',rep)
+            data=json.loads((Path(d)/"dt_data_split.json").read_text())
+            self.assertEqual(data['network_train_episode_count'],8)
+            self.assertEqual(data['heldout_episode_count'],8)
+            metrics=[json.loads(line) for line in (Path(d)/'dt_metrics.jsonl').read_text().splitlines()]
+            for row in metrics:
+                self.assertTrue(0<=row['grad_clip_fraction']<=1)
+                self.assertTrue(0<row['grad_clip_scale']<=1)
+                self.assertIn('dt_off_diagonal_fraction',row)
+            for tag in ('dt_early','dt_middle','dt_late'):
+                self.assertTrue((Path(d)/f'checkpoints/{tag}.ckpt').is_file())
+            from EfficientFlow.common.dt_mp1_lifetime import diagnose
+            before={tag:(Path(d)/f'checkpoints/{tag}.ckpt').read_bytes()
+                    for tag in ('dt_early','dt_middle','dt_late')}
+            life=diagnose([Path(d)/f'checkpoints/{tag}.ckpt' for tag in before],
+                          Path(d)/'lifetime',device='cpu',pairs=2)
+            self.assertIn('early_gain',life['stages']['middle']['summary'])
+            self.assertIn('middle_gain',life['stages']['late']['summary'])
+            self.assertFalse(life['training_gain_modified'])
+            for tag,content in before.items():
+                self.assertEqual((Path(d)/f'checkpoints/{tag}.ckpt').read_bytes(),content)
             resumed=TrainDTMP1Workspace(cfg,d); resumed.run()
             self.assertEqual(resumed.dt_selected,ws.dt_selected)
             torch.testing.assert_close(resumed.model.dt_K,ws.model.dt_K)
@@ -199,6 +299,38 @@ class DTTests(unittest.TestCase):
             cfg.dt.family="baseline"
             fork=TrainDTMP1Workspace(cfg,Path(d)/"fork"); fork.run()
             self.assertEqual((fork.dt_selected,fork.global_step),("baseline",2))
+
+    def test_preflight_only_exits_without_training_and_closes_runner(self):
+        cfg=config(); ds=Data()
+        cfg.dt.preflight_only=True
+        cfg.training.enable_rollouts=True
+        cfg.task.dataset._target_='tests.SyntheticReplayForDT'
+        cfg.task.env_runner._target_='tests.SyntheticRunnerForDT'
+        batch=next(iter(torch.utils.data.DataLoader(ds,batch_size=2)))
+        obs={k:v.numpy() for k,v in batch['obs'].items()}
+        closed=[]
+        runner=SimpleNamespace(env=SimpleNamespace(reset=lambda:obs,step=lambda a:(obs,None,None,None)),
+                               abs_action=False,close=lambda:closed.append(True))
+        import hydra
+        original=hydra.utils.instantiate
+        def build(node,*args,**kw):
+            target=node.get('_target_','')
+            if target=='tests.SyntheticReplayForDT': return ds
+            if target=='tests.SyntheticRunnerForDT': return runner
+            return original(node,*args,**kw)
+        with tempfile.TemporaryDirectory() as d, patch('hydra.utils.instantiate',side_effect=build):
+            ws=TrainDTMP1Workspace(cfg,d); ws.run()
+            self.assertEqual((ws.epoch,ws.global_step),(0,0))
+            self.assertTrue((Path(d)/'dt_rollout_preflight.json').is_file())
+            self.assertFalse((Path(d)/'checkpoints').exists())
+            self.assertEqual(closed,[True])
+
+    def test_baseline_alias_uses_identical_paired_costs(self):
+        from EfficientFlow.common.dt_mp1_calibration import evaluate
+        dt,_,_=self.models()
+        scores,_=evaluate(dt,Data(),{'baseline':('baseline',None),'early_gain':('baseline',None)},
+                          2,2,101,torch.device('cpu'),'test')
+        self.assertEqual(scores['baseline'],scores['early_gain'])
 
     def test_real_hdf5_layout_preflight(self):
         import h5py

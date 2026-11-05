@@ -2,6 +2,8 @@
 
 DT-MP1 v2.1：在 MP1 上对训练时的空间 JVP 方向进行校准。保留 `EfficientFlow.*` 导入路径，提供独立策略、训练器、六通道点云配置、数据读取、仿真资源与 CPU 测试。
 
+2026-11-05 审查修正加入点云预检、校准和裁剪日志、跨 checkpoint 的 K 诊断。逐文件同步命令见 [审查修正说明](EfficientFlow/docs/DTMP1_audit_response_20261105_zh.md)。
+
 ## 算法与文件
 
 `policy/dt_mp1.py` 继承原 MP1。训练先进行公共 warmup，再利用与训练轨迹分离的 fit / tune / accept / report 数据分区，拟合并筛选固定方向修正；校准完成后冻结修正矩阵。默认候选是 diagonal，同时保留标量和零修正对照。未通过筛选时允许退回标量或原 MP1 方向。
@@ -73,7 +75,7 @@ python -u train.py --config-name=DT_MP1 \
   hydra.run.dir=runs/DT_MP1_coffee_preparation_d1_1000_s10
 ```
 
-该命令使用六通道点云、4 步预测、2 步观测、实际执行后 3 步动作；1000 demos 对应 50 epochs，前 5 epochs 为 warmup。训练和校准显示 tqdm 进度条，默认每 epoch 保存 `checkpoints/latest.ckpt`，另保留公共 warmup 和最佳 rollout checkpoint。`dt_calibration.json` 保存筛选结果，`dt_metrics.jsonl` 保存训练指标。断点恢复时使用同一 `hydra.run.dir` 和相同训练配置；新实验使用新目录。
+该命令使用六通道点云、4 步预测、2 步观测，执行预测序列的后 3 步。1000 demos 中有 840 条用于训练，160 条留给校准和验证。共训练 50 epochs，前 5 epochs 为 warmup，默认每 5 epochs 运行 rollout。`dt_data_split.json` 记录轨迹划分，`dt_calibration.json` 保存筛选结果，`dt_metrics.jsonl` 保存训练指标。断点恢复时使用同一 `hydra.run.dir` 和相同训练配置。
 
 不使用在线日志可加 `logging.mode=offline`；只检查训练流程可加 `training.enable_rollouts=false`。`--verify` 只检查配置解析与入口，不读取真实数据或启动仿真。
 
@@ -89,7 +91,7 @@ python EfficientFlow/scripts/eval_mp1_checkpoint.py \
   --output-dir runs/DT_MP1_eval --mode offline --n-envs 2
 ```
 
-测试覆盖零修正的原 MP1 参数梯度等价、六通道接口、动作窗口、归一化隔离、校准筛选和保存恢复。验证范围见 [VALIDATION.md](VALIDATION.md)。没有附带真实 GPU 训练结果或机器人成功率数据。
+当前验证覆盖零修正的参数梯度和 AdamW 更新、六通道接口、动作窗口、归一化隔离、校准筛选、保存恢复和跨阶段诊断。详见 [本次验证记录](EfficientFlow/docs/VALIDATION_DT_MP1.txt) 和 [初版验证记录](VALIDATION.md)。
 
 ## 来源与许可证
 

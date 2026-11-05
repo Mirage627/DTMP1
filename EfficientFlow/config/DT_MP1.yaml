@@ -1,5 +1,5 @@
 defaults:
-  - task: mimicgen_pc_abs
+  - task: mimicgen_dt_pc_abs
   - _self_
 
 name: train_dt_mp1
@@ -7,7 +7,7 @@ _target_: EfficientFlow.workspace.train_dt_mp1_workspace.TrainDTMP1Workspace
 
 task_name: stack_d1
 n_demo: 200
-shape_meta: ${task.shape_meta}
+shape_meta: ${task.policy_shape_meta}
 exp_name: "debug"
 
 horizon: 4
@@ -36,8 +36,10 @@ dt:
   accept_pairs: 16
   report_pairs: 8
   budget_seconds: 60.0
-  amortization_windows: 1000
-  alpha: 0.05
+  # Calibration/report time is amortized over actual remaining training batches.
+  alpha: 0.05  # bootstrap significance level, NOT the tangent correction strength
+  save_stage_checkpoints: true  # diagnostic model snapshots, not resumable checkpoints
+  preflight_only: false  # load data + reset/infer/step, then exit before training
   seed: 314159
 
 policy:
@@ -117,7 +119,7 @@ training:
   num_epochs: ${eval:'int(50000 / ${n_demo})'}
   gradient_accumulate_every: 1
   use_ema: True
-  rollout_every: ${eval:'max(1,int(1000 / ${n_demo}))'}
+  rollout_every: ${eval:'max(5,int(1000 / ${n_demo}))'}
   checkpoint_every: ${eval:'max(1,int(1000 / ${n_demo}))'}
   enable_rollouts: true
   val_every: 1

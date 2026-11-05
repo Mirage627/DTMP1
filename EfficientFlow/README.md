@@ -17,6 +17,9 @@ Xi'an Jiaotong University
 
 ## Installation
 
+DT-MP1 的审查修正、点云预检、训练数据数、跨 checkpoint 诊断与同步方法见
+[DT-MP1 修正说明](docs/DTMP1_audit_response_20261105_zh.md)。
+
 ### EfficientAdaFlow research variant
 
 A variance-adaptive equivariant flow variant is available in

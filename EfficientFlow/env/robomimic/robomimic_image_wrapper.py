@@ -6,6 +6,7 @@ import gym
 from gym import spaces
 from omegaconf import OmegaConf
 from robomimic.envs.env_robosuite import EnvRobosuite
+from EfficientFlow.common.mp1_observation_contract import validate_point_cloud
 
 class RobomimicImageWrapper(gym.Env):
     def __init__(self, 
@@ -73,6 +74,8 @@ class RobomimicImageWrapper(gym.Env):
 
         obs = dict()
         for key in self.observation_space.keys():
+            if self.shape_meta['obs'][key].get('type') == 'point_cloud':
+                validate_point_cloud(raw_obs, key, self.shape_meta['obs'][key]['shape'])
             obs[key] = raw_obs[key]
         return obs
 

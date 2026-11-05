@@ -1,0 +1,36 @@
+DT-MP1 audit correction validation
+Date: 2026-11-05 (Asia/Shanghai)
+Source: D:/GithubRepo/EfficientFlow working tree
+
+PASS: publication checkout, python -B -u -m unittest discover
+      -s EfficientFlow/tests -p test_dt_mp1.py -v
+      14 tests, 24.935 seconds, OK.
+PASS: publication checkout, train.py --verify --config-name=DT_MP1
+      task_name=coffee_preparation_d1 n_demo=1000
+
+PASS: python -B -u -m unittest discover -s tests -p test_dt_mp1.py -v
+      14 tests, 26.864 seconds, OK.
+      Includes the real frozen-gradient diagnostic pipeline on synthetic data,
+      warmup/fork/resume, preflight-only exit/cleanup, baseline timing aliases,
+      zero-gain gradients/AdamW for batch sizes 2 and 4, non-symmetric gains,
+      XYZRGB checks and train-only normalization.
+PASS: python -B train.py --verify --config-name=DT_MP1
+      task_name=coffee_preparation_d1 n_demo=1000
+PASS: test_mp1_data_conversion.py: 3 tests.
+PARTIAL: test_mp1_env_reset.py: 3 passed; one action-diagnostic test could not
+         import the installed SciPy DLL (Windows application control, WinError
+         4551). Retried outside the sandbox with the same result. This is not
+         reported as a passing suite; no system security policy was changed.
+PASS: git diff --check for affected tracked files.
+PASS: included Python sources parse successfully and published file bytes match
+      the per-file SHA-256 manifests after LF normalization.
+
+Runtime: Python 3.9.15 / PyTorch 2.1 CPU on Windows, small model widths.
+Local task dependencies: tmp/mp1_cpu_validation on PYTHONPATH.
+The first sandboxed test failed on atomic checkpoint replacement (WinError 5).
+The approved outside-sandbox run passes checkpoint save/restore tests.
+
+NOT EXECUTED: real dataset training, CUDA validation, full-sized GPU memory/time
+measurement, real simulator reset/inference/step, real checkpoint lifetime
+experiment, trajectory-cluster/multi-seed inference, or equal GPU-hour rollout.
+Server read-only SSH failed authentication: Permission denied (publickey,password).

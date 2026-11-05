@@ -1,4 +1,4 @@
-"""DT-MP1 v2.1 calibration/selection. All random batches are paired by seed."""
+"""DT-MP1 calibration/selection. Conditional batch-pair diagnostics, not rollout CIs."""
 import hashlib
 import json
 import math
@@ -176,7 +176,7 @@ def evaluate(model,ds,options,bs,pairs,seed,device,stage,workers=0,mechanism=Fal
             del nl,nr
         for key,(fam,k) in options.items():
             model.set_gain(fam,k)
-            if key=="baseline": l,r,c1,c2=bl,br,tl,tr
+            if key=="baseline" or fam=="baseline": l,r,c1,c2=bl,br,tl,tr
             else: (l,c1),(r,c2)=measure()
             var,drift=pair_stats(l,r,bl,br)
             scores[key].append([var,drift,(c1+c2)/2])
@@ -205,6 +205,16 @@ def risks(scores, budget, overhead, locked_costs=None):
         if n>=1: out[key]=(a[:,0]/n+a[:,1],a[:,1],n)
     if "baseline" not in out: raise ValueError("dt.budget_seconds is shorter than one baseline batch")
     return out
+
+
+def allocated_overhead(seconds, remaining_batches, baseline_seconds, budget):
+    """Allocate calibration cost to a baseline-time window of the remaining run."""
+    if remaining_batches < 1 or baseline_seconds <= 0 or budget <= 0 or seconds < 0:
+        raise ValueError("Invalid remaining-training cost plan")
+    values = (seconds, remaining_batches, baseline_seconds, budget)
+    if not all(math.isfinite(v) for v in values):
+        raise ValueError("Non-finite cost plan")
+    return seconds * min(1., budget / (remaining_batches * baseline_seconds))
 
 
 def choose(locked, risks_, alpha):
@@ -236,7 +246,7 @@ def choose(locked, risks_, alpha):
     return selected,checks
 
 
-def calibrate(model,ds,cfg,bs,output,device,workers=0):
+def calibrate(model,ds,cfg,bs,output,device,workers=0,*,remaining_batches=None,checkpoint_path=None):
     names=families(cfg.family)
     if not names: return "baseline",None
     start=time.perf_counter()
@@ -245,14 +255,15 @@ def calibrate(model,ds,cfg,bs,output,device,workers=0):
         tmp=path.with_suffix(".tmp")
         tmp.write_text(json.dumps(report,ensure_ascii=False,indent=2,allow_nan=False),encoding="utf8")
         os.replace(tmp,path)
-    if cfg.amortization_windows<1 or not 0<cfg.alpha<1 or cfg.fit_batches<1:
+    if remaining_batches is None or remaining_batches < 1 or not 0<cfg.alpha<1 or cfg.fit_batches<1:
         raise ValueError("Invalid DT calibration settings")
     splits,ids=partitions(ds,int(cfg.seed))
     seed=int(cfg.seed)
     if device.type=="cuda": torch.cuda.reset_peak_memory_stats(device)
     options,n=fit(model,paired_batches(splits["fit"],cfg.fit_batches,bs,seed,workers),names,device)
     digest=hashlib.sha256()
-    with (Path(output)/"checkpoints/dt_warmup.ckpt").open("rb") as fp:
+    checkpoint_path=Path(checkpoint_path or Path(output)/"checkpoints/dt_warmup.ckpt")
+    with checkpoint_path.open("rb") as fp:
         for chunk in iter(lambda:fp.read(4<<20),b""): digest.update(chunk)
     channels=(["x","y","z"]+[f"rotation_6d[{i}]" for i in range(6)]+["gripper"]
               if model.action_dim==10 else [f"action[{i}]" for i in range(model.action_dim)])
@@ -260,9 +271,11 @@ def calibrate(model,ds,cfg,bs,output,device,workers=0):
             "n_active_fit":n,"w":model.w,"basis":model.dt_U.cpu().tolist(),
             "action_order":"normalized sequence, time-major; channels in dataset rotation_6d order",
             "candidates":{k:None if v is None else v.tolist() for k,(_,v) in options.items()},
-            "checkpoint":"checkpoints/dt_warmup.ckpt","checkpoint_sha256":digest.hexdigest(),
-            "action_channels":channels,"amortization_windows":cfg.amortization_windows,
+            "checkpoint":str(checkpoint_path.resolve()),"checkpoint_sha256":digest.hexdigest(),
+            "action_channels":channels,"remaining_training_batches":int(remaining_batches),
             "budget_seconds":cfg.budget_seconds,"alpha":cfg.alpha,
+            "statistical_scope":"Approximate batch-pair bootstrap conditional on fixed episodes and measured timings; not a population or rollout guarantee.",
+            "cost_scope":"Measured full-gradient compute only; excludes training data loading, optimizer, EMA and rollout. Full calibration/report time is charged; not a measured GPU-hours training comparison.",
             "code_sha256":{str(p.name):hashlib.sha256(p.read_bytes()).hexdigest() for p in
                 [Path(__file__),Path(__file__).parents[1]/"policy/dt_mp1.py"]}}
     save()
@@ -270,7 +283,9 @@ def calibrate(model,ds,cfg,bs,output,device,workers=0):
         report.update(selected="baseline",reason="no valid nonzero fit"); save()
         return "baseline",None
     tune,_=evaluate(model,splits["tune"],options,bs,cfg.tune_pairs,seed+100000,device,"tune",workers)
-    cost=lambda: (time.perf_counter()-start)/cfg.amortization_windows
+    baseline_seconds=float(np.mean(np.asarray(tune["baseline"])[:,2]))
+    cost=lambda: allocated_overhead(time.perf_counter()-start,remaining_batches,
+                                    baseline_seconds,cfg.budget_seconds)
     tr=risks(tune,cfg.budget_seconds,cost())
     winners={}
     for fam in names:
@@ -283,6 +298,8 @@ def calibrate(model,ds,cfg,bs,output,device,workers=0):
     fixed={"baseline":options["baseline"],**winners}
     costs={k:float(np.mean(np.asarray(tune[k])[:,2])) for k in fixed}
     report.update(tune=tune,locked=list(fixed),strong_scalar=strong,locked_gradient_seconds=costs); save()
+    # Charge actual report wall time. Its gradient statistics NEVER enter the gate.
+    test,mech=evaluate(model,splits["report"],fixed,bs,cfg.report_pairs,seed+300000,device,"report",workers,True)
     acceptance,_=evaluate(model,splits["accept"],fixed,bs,cfg.accept_pairs,seed+200000,device,"accept",workers)
     allocated=cost()
     ar=risks(acceptance,cfg.budget_seconds,allocated,costs)
@@ -296,8 +313,9 @@ def calibrate(model,ds,cfg,bs,output,device,workers=0):
     report.update(acceptance=acceptance,upper_bounds=checks,selected=selected,
                   seconds_through_decision=time.perf_counter()-start,allocated_seconds=allocated,
                   independent_batches_per_budget={k:v[2] for k,v in ar.items()}); save()
-    test,mech=evaluate(model,splits["report"],fixed,bs,cfg.report_pairs,seed+300000,device,"report",workers,True)
     report.update(locked_test=test,spatial_decomposition_time_difference_cross=mech,
+                  baseline_gradient_seconds=baseline_seconds,
+                  estimated_remaining_baseline_gradient_seconds=remaining_batches*baseline_seconds,
                   peak_allocated_bytes=torch.cuda.max_memory_allocated(device) if device.type=="cuda" else None,
                   total_seconds=time.perf_counter()-start); save()
     print(f"DT accepted: {selected}; audit: {path}",flush=True)

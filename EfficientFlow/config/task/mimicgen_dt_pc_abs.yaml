@@ -1,0 +1,25 @@
+# DT training consumes XYZRGB and robot state; cameras remain in the runner.
+defaults:
+  - mimicgen_pc_abs
+  - _self_
+
+name: mimicgen_dt_pc_abs
+
+# Use an independent metadata node so Hydra does not merge the unused RGB key
+# back into the training observations inherited from mimicgen_pc_abs.
+policy_shape_meta:
+  obs:
+    point_cloud:
+      shape: [1024, 6]
+      type: point_cloud
+    robot0_eef_pos:
+      shape: [3]
+    robot0_eef_quat:
+      shape: [4]
+    robot0_gripper_qpos:
+      shape: [2]
+  action:
+    shape: [10]
+
+dataset:
+  shape_meta: ${task.policy_shape_meta}
