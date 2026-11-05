@@ -32,6 +32,18 @@ dt:
   warmup_epochs: 5
   warmup_checkpoint: null  # optional warmup.ckpt from the same training setup
   fit_batches: 8
+  basis:
+    mode: joint_gradient  # joint_gradient, gradient, residual, dct_all, legacy_first4
+    rank: 8  # fixed BEFORE calibration; dct_all needs a multiple of action_dim
+    compare_dct: true  # also fit a whole-channel, constant-time DCT candidate
+    calibration_split: fit  # acceptance/report must never fit U or K
+    min_samples: 128  # active draws; this is not a count of independent trajectories
+    min_relative_eigenvalue: 1.0e-6
+    min_relative_gap: 1.0e-4  # reject an unstable rank boundary
+  gain_norm_limit: 2.0  # additional lower bound may be configured; never above 2
+  max_relative_correction: 2.0  # fit-set tail guard, not a mathematical guarantee
+  relative_correction_quantile: 0.99
+  # One joint (U,K) calibration after warmup; no automatic periodic refitting.
   tune_pairs: 8
   accept_pairs: 16
   report_pairs: 8

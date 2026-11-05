@@ -11,10 +11,11 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from EfficientFlow.common.dt_mp1_calibration import calibrate, evaluate, partitions, risks, choose
+from EfficientFlow.common.dt_mp1_state import Correction, normalizer_fingerprint
 from EfficientFlow.workspace.train_dt_mp1_workspace import capture, restore, signature
 
 
-def summarize(scores, budget, alpha):
+def summarize(scores, options, budget, alpha):
     # Calibration is already paid for: this measures the lifetime of a fixed gain.
     estimates = risks(scores, budget, overhead=0.)
     result = {}
@@ -28,7 +29,8 @@ def summarize(scores, budget, alpha):
             item.update(equal_compute_risk=float(estimates[key][0].mean()),
                         batches_per_budget=estimates[key][2])
         if key != "baseline":
-            selected, bounds = choose({key:None}, estimates, alpha) if key in estimates else ("baseline", {})
+            # A diagnostic against baseline only; no claim of winning all families.
+            selected, bounds = choose({key:options[key],"strong":key}, estimates, alpha) if key in estimates else ("baseline", {})
             item.update(diagnostic_fallback_to_baseline=selected == "baseline", upper_bounds=bounds)
         result[key] = item
     return result
@@ -55,7 +57,7 @@ def diagnose(checkpoints, output, *, device="cuda:0", pairs=16, workers=0, datas
     sources = {}
     reference = None
     previous_epoch = -1
-    reference_basis = None
+    reference_normalizer = None
     try:
         for stage, path in zip(("early", "middle", "late"), paths):
             payload = torch.load(path, map_location="cpu", pickle_module=dill, weights_only=False)
@@ -72,9 +74,10 @@ def diagnose(checkpoints, output, *, device="cuda:0", pairs=16, workers=0, datas
             model = hydra.utils.instantiate(cfg.policy)
             model.load_state_dict(payload["state_dicts"]["model"], strict=True)
             model.to(device).eval()
-            if reference_basis is not None and not torch.equal(model.dt_U.cpu(), reference_basis):
-                raise ValueError("Stage action bases differ; the same K would represent different directions")
-            reference_basis = model.dt_U.detach().cpu().clone()
+            fingerprint=normalizer_fingerprint(model)
+            if reference_normalizer is not None and fingerprint != reference_normalizer:
+                raise ValueError("Stage normalizers differ; correction coordinates cannot be transferred")
+            reference_normalizer=fingerprint
             if stage == "early":
                 data_cfg = OmegaConf.create(OmegaConf.to_container(cfg.task.dataset, resolve=True))
                 if dataset_path is not None:
@@ -86,10 +89,8 @@ def diagnose(checkpoints, output, *, device="cuda:0", pairs=16, workers=0, datas
                 batches = min(len(DataLoader(ds, **cfg.dataloader)), cfg.training.max_train_steps or float("inf"))
                 if not batches:
                     raise ValueError("No training batches for lifetime cost plan")
-                family = payload["dt_selected"]
-                gain = model.dt_global if family == "global_scalar" else model.dt_K
-                sources["early_gain"] = (family, None if family == "baseline" else gain.detach().cpu().clone())
-                report["early_gain"] = {"family":family, "gain":None if family == "baseline" else gain.tolist()}
+                sources["early_gain"] = Correction.capture(model)
+                report["early_gain"] = sources["early_gain"].as_dict()
             if stage == "middle":
                 middle_output = output/"middle_refit"
                 middle_output.mkdir()
@@ -98,20 +99,19 @@ def diagnose(checkpoints, output, *, device="cuda:0", pairs=16, workers=0, datas
                 remaining = max(1, int(batches)*(int(cfg.training.num_epochs)-epoch))
                 np.random.seed(cfg.dt.seed); torch.manual_seed(cfg.dt.seed)
                 sources["middle_gain"] = calibrate(model, ds, cfg.dt, bs, middle_output, device,
-                    workers, remaining_batches=remaining, checkpoint_path=path)
-                fam, gain = sources["middle_gain"]
-                report["middle_gain"] = {"family":fam, "gain":None if gain is None else gain.tolist(),
+                    workers, remaining_batches=remaining, checkpoint_path=path,max_grad_norm=cfg.training.max_grad_norm)
+                report["middle_gain"] = {**sources["middle_gain"].as_dict(),
                                          "remaining_batches_for_refit":remaining}
-            options = {"baseline":("baseline",None), **sources}
+            options = {"baseline":Correction(model.dt_U.detach().cpu().clone(),"baseline"), **sources}
             scores, _ = evaluate(model, splits["report"], options, bs, pairs, int(cfg.dt.seed)+400000,
-                                 device, "lifetime "+stage, workers)
+                                 device, "lifetime "+stage, workers,max_grad_norm=cfg.training.max_grad_norm)
             digest = hashlib.sha256()
             with path.open("rb") as stream:
                 for chunk in iter(lambda:stream.read(4<<20), b""):
                     digest.update(chunk)
             report["stages"][stage] = {"checkpoint":str(path), "sha256":digest.hexdigest(),
                 "epoch":epoch,"global_step":int(payload["global_step"]),"paired_scores":scores,
-                "summary":summarize(scores, float(cfg.dt.budget_seconds), float(cfg.dt.alpha))}
+                "summary":summarize(scores, options, float(cfg.dt.budget_seconds), float(cfg.dt.alpha))}
             (output/"dt_lifetime.json").write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf8")
             del model, payload
         decisions = [v["diagnostic_fallback_to_baseline"] for stage in report["stages"].values()

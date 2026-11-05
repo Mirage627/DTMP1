@@ -4,6 +4,8 @@ DT-MP1 v2.1：在 MP1 上对训练时的空间 JVP 方向进行校准。保留 `
 
 2026-11-05 审查修正加入点云预检、校准和裁剪日志、跨 checkpoint 的 K 诊断。逐文件同步命令见 [审查修正说明](EfficientFlow/docs/DTMP1_audit_response_20261105_zh.md)。
 
+同日 U 设计复核进一步改为完整代理梯度矩阵的左右联合 SVD 候选，与全通道 DCT 基共同拟合和比较；每个 U 都重新拟合 K，独立梯度验收后才启用。新增 U/K/normalizer 完整性检查、不同秩恢复与整对跨阶段诊断。数学依据、反例、22 项 CPU 回归和本次逐文件同步命令见 [U 设计复核](EfficientFlow/docs/DTMP1_basis_review_20261105_zh.md)。该设计仍是需实证验证的启发式，不保证降低真实任务失败率。
+
 ## 算法与文件
 
 `policy/dt_mp1.py` 继承原 MP1。训练先进行公共 warmup，再利用与训练轨迹分离的 fit / tune / accept / report 数据分区，拟合并筛选固定方向修正；校准完成后冻结修正矩阵。默认候选是 diagonal，同时保留标量和零修正对照。未通过筛选时允许退回标量或原 MP1 方向。
@@ -16,6 +18,7 @@ DT-MP1 v2.1：在 MP1 上对训练时的空间 JVP 方向进行校准。保留 `
 | --- | --- |
 | DT 策略与方向修正 | `policy/dt_mp1.py` |
 | 训练集归一化、校准、筛选 | `common/dt_mp1_calibration.py` |
+| 联合 SVD 选基与成对状态校验 | `common/dt_mp1_basis.py`、`common/dt_mp1_state.py` |
 | 公共 warmup、恢复、checkpoint、进度条 | `workspace/train_dt_mp1_workspace.py` |
 | 六通道 XYZRGB 训练配置 | `config/DT_MP1.yaml` |
 | 回归测试 | `tests/test_dt_mp1.py` |

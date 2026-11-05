@@ -3,13 +3,25 @@ import math
 import torch
 from EfficientFlow.policy.mp1 import Meanpolicy, adaptive_l2_loss
 from EfficientFlow.common.pytorch_util import dict_apply
+from EfficientFlow.common.dt_mp1_state import (Correction, FAMILIES, normalizer_fingerprint,
+    tensor_fingerprint, validate_correction)
 
 
-def action_basis(horizon, action_dim):
-    # Rows match tensor.flatten(1): time first, action coordinate last.
+def action_basis(horizon, action_dim, mode="dct_all", rank=None):
+    """Static ablations: equal time-frequency coverage for every action channel.
+
+    The historical first-four-channel basis is explicit opt-in only. A balanced
+    DCT rank must contain whole frequency blocks, never a prefix of channels.
+    """
+    if mode not in ("dct_all", "legacy_first4"):
+        raise ValueError(f"Unknown static DT basis: {mode}")
+    channels = min(4, action_dim) if mode == "legacy_first4" else action_dim
+    frequencies = min(2, horizon) if rank is None else rank // channels
+    if rank is not None and (rank % channels or not 1 <= frequencies <= horizon):
+        raise ValueError("Static DT rank must contain complete action-channel blocks")
     basis = []
-    for ch in range(min(4, action_dim)):
-        for freq in range(min(2, horizon)):
+    for ch in range(channels):
+        for freq in range(frequencies):
             b = torch.zeros(horizon, action_dim, dtype=torch.float64)
             t = torch.arange(horizon, dtype=b.dtype) + .5
             col = torch.cos(freq * math.pi * t / horizon)
@@ -31,33 +43,74 @@ class DTMP1Policy(Meanpolicy):
         self.register_buffer("dt_U", u)
         self.register_buffer("dt_K", torch.zeros(u.shape[1], u.shape[1]))
         self.register_buffer("dt_global", torch.zeros(()))
+        self.register_buffer("dt_family", torch.zeros((), dtype=torch.int64))
 
     @torch.no_grad()
     def set_gain(self, family, gain=None):
-        k = torch.zeros_like(self.dt_K)
-        g = torch.zeros_like(self.dt_global)
-        if family != "baseline":
-            value = torch.as_tensor(gain, device=k.device, dtype=k.dtype)
-            if not torch.isfinite(value).all():
-                raise ValueError("Non-finite DT gain")
-            if family == "global_scalar" and value.ndim == 0:
-                g.copy_(value)
-                size = g.abs()
-            elif family in ("sub_scalar", "diagonal", "full") and value.shape == k.shape:
-                diagonal = torch.diag(torch.diagonal(value))
-                if family in ("diagonal", "sub_scalar") and not torch.equal(value, diagonal):
-                    raise ValueError(f"{family} requires an exactly diagonal gain")
-                if family == "sub_scalar" and not torch.equal(
-                        value, torch.eye(len(k), device=k.device, dtype=k.dtype)*value[0, 0]):
-                    raise ValueError("sub_scalar requires a scalar multiple of identity")
-                k.copy_(value)
-                size = torch.linalg.matrix_norm(k, ord=2)
-            else:
-                raise ValueError(f"Wrong DT gain shape for {family}: {value.shape}")
-            if not torch.isfinite(size) or size > 2:
-                raise ValueError("Invalid DT gain")
-        self.dt_K.copy_(k)
-        self.dt_global.copy_(g)
+        self.set_correction(Correction(self.dt_U, family, gain))
+
+    @torch.no_grad()
+    def set_basis(self, basis):
+        if self.dt_K.ne(0).any() or self.dt_global.ne(0):
+            raise ValueError("Reset gain before changing U; old K cannot be reused with a new basis")
+        self.set_correction(Correction(basis, "baseline"))
+
+    def prepare_correction(self, correction):
+        expected = correction.metadata.get("normalizer_sha256")
+        if expected is not None and expected != normalizer_fingerprint(self):
+            raise ValueError("DT correction normalizer fingerprint mismatch")
+        u = correction.basis.to(device=self.dt_U.device, dtype=self.dt_U.dtype)
+        u,k,g = validate_correction(u, correction.family, correction.gain, self.horizon*self.action_dim)
+        return u.clone(), k.clone(), g.clone(), FAMILIES.index(correction.family)
+
+    @torch.no_grad()
+    def _install_correction(self, u, k, g, family):
+        self.dt_U, self.dt_K, self.dt_global = u, k, g
+        self.dt_family.fill_(family)
+
+    def set_correction(self, correction):
+        self._install_correction(*self.prepare_correction(correction))
+
+    def set_normalizer(self, normalizer):
+        if (self.dt_K.ne(0).any() or self.dt_global.ne(0)) and (
+                tensor_fingerprint(normalizer.state_dict()) != normalizer_fingerprint(self)):
+            raise ValueError("Reset DT gain before changing the normalizer coordinates")
+        super().set_normalizer(normalizer)
+
+    @staticmethod
+    def _integrity(state, prefix):
+        fields = {k[len(prefix):]:v for k,v in state.items() if k.startswith(prefix) and
+                  (k[len(prefix):] in ("dt_U", "dt_K", "dt_global", "dt_family") or
+                   k[len(prefix):].startswith("normalizer."))}
+        return torch.tensor(list(bytes.fromhex(tensor_fingerprint(fields))), dtype=torch.uint8)
+
+    def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
+        state = super().state_dict(*args, destination=destination, prefix=prefix, keep_vars=keep_vars)
+        state[prefix+"dt_integrity"] = self._integrity(state, prefix)
+        return state
+
+    def _load_from_state_dict(self, state, prefix, metadata, strict, missing, unexpected, errors):
+        # Verify before mutation, and resize registered buffers for a calibrated rank.
+        u,k,g = (state[prefix+n] for n in ("dt_U", "dt_K", "dt_global"))
+        digest = state.pop(prefix+"dt_integrity", None)
+        if digest is not None:
+            if not torch.equal(digest.cpu(), self._integrity(state, prefix)):
+                raise ValueError("DT checkpoint U/K/normalizer fingerprint mismatch")
+            family = FAMILIES[int(state[prefix+"dt_family"])]
+        else:
+            # Explicit compatibility with pre-v4 checkpoints only.
+            legacy = action_basis(self.horizon, self.action_dim, "legacy_first4")
+            if prefix+"dt_family" in state or u.shape != legacy.shape or not torch.equal(u.cpu(),legacy):
+                raise ValueError("Missing DT checkpoint integrity fingerprint")
+            family = "global_scalar" if g.ne(0) else ("full" if k.ne(0).any() else "baseline")
+            state[prefix+"dt_family"] = torch.tensor(FAMILIES.index(family))
+        gain = g if family == "global_scalar" else (None if family == "baseline" else k)
+        _,expected_k,expected_g = validate_correction(u, family, gain, self.horizon*self.action_dim)
+        if not torch.equal(k,expected_k) or not torch.equal(g,expected_g):
+            raise ValueError("Inconsistent DT family and gain buffers")
+        self.dt_U = torch.empty_like(u, device=self.dt_U.device)
+        self.dt_K = torch.empty_like(k, device=self.dt_K.device)
+        super()._load_from_state_dict(state,prefix,metadata,strict,missing,unexpected,errors)
 
     def _normalize_observations(self, observations):
         pc = observations["point_cloud"]
@@ -139,7 +192,32 @@ class DTMP1Policy(Meanpolicy):
                           "dt_gain_nonzero":float(bool(self.dt_global.ne(0) | self.dt_K.ne(0).any()))}
 
     @torch.no_grad()
-    def calibration_rows(self, batch):
+    def basis_rows(self, batch):
+        """Return detached v, ell, H.T ell; H = (t-r) J_x, with frozen c,t,r."""
+        x,t,r,c,dw,v = self._draw(batch)
+        delta = t-r
+        active = delta > 0
+        if not active.any():
+            return None, delta
+        x,t,r,c,v = (a[active].detach() for a in (x,t,r,c,v))
+        hv = (t-r)[:,None,None]*self._jvp(x,t,r,c,v,0)
+        ell = (v-hv).detach()
+        with torch.enable_grad():
+            xx = x.detach().requires_grad_(True)
+            prediction = self.model(xx,t,r=r,global_cond=c,training=False)
+            hte = torch.autograd.grad(prediction, xx,
+                grad_outputs=((t-r)[:,None,None]*ell), create_graph=False)[0]
+        return (v.flatten(1), ell.flatten(1), hte.detach().flatten(1)), delta
+
+    @torch.no_grad()
+    def correction_ratios(self, batch):
+        _,t,r,_,dw,v = self._draw(batch)
+        active = t > r
+        change = self.tangent(dw,v,active)-dw
+        return (change.flatten(1).norm(dim=1)/(dw.flatten(1).norm(dim=1)+1e-8))[active], t-r
+
+    @torch.no_grad()
+    def calibration_rows(self, batch, *, need_basis=True):
         x,t,r,c,_,v = self._draw(batch)
         active = t > r
         if not active.any():
@@ -147,7 +225,7 @@ class DTMP1Policy(Meanpolicy):
         x,t,r,c,v = (a[active] for a in (x,t,r,c,v))
         def spatial(vec):
             return ((t-r)[:,None,None]*self._jvp(x,t,r,c,vec,0)).flatten(1)
-        R = torch.stack([spatial(u.reshape(1,*x.shape[1:]).expand_as(x))
-                         for u in self.dt_U.T],dim=-1)
+        R = (torch.stack([spatial(u.reshape(1,*x.shape[1:]).expand_as(x))
+                         for u in self.dt_U.T],dim=-1) if need_basis else x.new_empty(len(x),x[0].numel(),0))
         hv = spatial(v)
         return R, v.flatten(1)@self.dt_U, hv, v.flatten(1)-hv

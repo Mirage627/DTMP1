@@ -14,6 +14,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from EfficientFlow.common.dt_mp1_calibration import calibrate, families, partitions, train_normalizer
+from EfficientFlow.common.dt_mp1_state import FAMILIES, apply_correction, normalizer_fingerprint
 from EfficientFlow.common.dt_mp1_preflight import rollout_preflight
 from EfficientFlow.common.pytorch_util import dict_apply, optimizer_to
 from EfficientFlow.common.swanlab_logging import SwanLabLogger, scalar_metrics
@@ -81,7 +82,7 @@ def data_report(ds, requested, batch_size, batches, accum):
 
 
 class TrainDTMP1Workspace(BaseWorkspace):
-    include_keys=("epoch","global_step","dt_selected","rng","best_score")
+    include_keys=("epoch","global_step","dt_selected","dt_calibration","rng","best_score")
     def __init__(self,cfg,output_dir=None):
         super().__init__(cfg,output_dir)
         random.seed(cfg.training.seed); np.random.seed(cfg.training.seed); torch.manual_seed(cfg.training.seed)
@@ -90,6 +91,7 @@ class TrainDTMP1Workspace(BaseWorkspace):
         self.optimizer=hydra.utils.instantiate(cfg.optimizer,params=self.model.parameters())
         self.epoch=self.global_step=0
         self.dt_selected=None
+        self.dt_calibration=None
         self.best_score=-math.inf
         self.rng=None
         self.scheduler=None
@@ -113,6 +115,15 @@ class TrainDTMP1Workspace(BaseWorkspace):
         skip=list(exclude_keys or ())
         if self.scheduler is None: skip.append("scheduler")
         super().load_payload(payload,exclude_keys=skip,include_keys=keys,**kwargs)
+        if self.ema_model is not None:
+            for name in ("dt_U","dt_K","dt_global","dt_family"):
+                if not torch.equal(getattr(self.model,name).cpu(),getattr(self.ema_model,name).cpu()):
+                    raise ValueError("Checkpoint main/EMA DT correction mismatch")
+        if self.dt_calibration is not None:
+            if self.dt_calibration.get("normalizer_sha256") != normalizer_fingerprint(self.model):
+                raise ValueError("Checkpoint calibration normalizer fingerprint mismatch")
+            if self.dt_selected != FAMILIES[int(self.model.dt_family)]:
+                raise ValueError("Checkpoint selected family differs from correction state")
 
     def _save_stage(self, tag):
         # Diagnostics need the current training model, not optimizer/EMA copies.
@@ -120,7 +131,7 @@ class TrainDTMP1Workspace(BaseWorkspace):
         tmp=path.with_suffix(".partial")
         payload={"cfg":self.cfg,"state_dicts":{"model":self.model.state_dict()},
                  "diagnostic_only":True,"epoch":self.epoch,"global_step":self.global_step,
-                 "dt_selected":self.dt_selected}
+                 "dt_selected":self.dt_selected,"dt_calibration":self.dt_calibration}
         path.parent.mkdir(parents=True,exist_ok=True)
         with tmp.open("wb") as fp: torch.save(payload,fp,pickle_module=dill)
         os.replace(tmp,path)
@@ -210,15 +221,17 @@ class TrainDTMP1Workspace(BaseWorkspace):
                     saved=capture()
                     try:
                         self.model.eval()
-                        family,gain=calibrate(self.model,ds,cfg.dt,cfg.dataloader.batch_size,output,device,
+                        correction=calibrate(self.model,ds,cfg.dt,cfg.dataloader.batch_size,output,device,
                                               cfg.dataloader.num_workers,
-                                              remaining_batches=batches*(train.num_epochs-self.epoch))
+                                              remaining_batches=batches*(train.num_epochs-self.epoch),
+                                              max_grad_norm=train.max_grad_norm)
                     finally:
                         self.model.train()
                         restore(saved)
-                    self.model.set_gain(family,gain)
-                    if self.ema_model is not None: self.ema_model.set_gain(family,gain)
+                    apply_correction(correction,self.model,self.ema_model)
+                    family=correction.family
                     self.dt_selected=family
+                    self.dt_calibration=correction.metadata
                     self._save("latest")
                     if cfg.dt.get("save_stage_checkpoints",True): self._save_stage("dt_early")
                     print("DT locked for remaining epochs:",family,flush=True)
